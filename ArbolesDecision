@@ -1,0 +1,116 @@
+import itertools
+import multiprocess
+import time
+import pandas as pd
+import numpy as np
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+# Distribuir las combinaciones de hiperparametros
+def nivelacion_cargas(combinaciones, n_p):
+    total_combinations = len(combinaciones)
+    base_size = total_combinations // n_p
+    remainder = total_combinations % n_p
+
+    # Distribuir las combinaciones
+    carga_dividida = []
+    start_idx = 0
+    for i in range(n_p):
+        size = base_size + (1 if i < remainder else 0)
+        end_idx = start_idx + size
+        carga_dividida.append(combinaciones[start_idx:end_idx])
+        start_idx = end_idx
+
+    return carga_dividida
+
+# Parámetros del modelo
+param_grid_tree = {
+    'criterion': ['gini', 'entropy', 'log_loss'],
+    'splitter': ['best', 'random'],
+    'max_depth': [None, 10, 20, 30, 40],
+}
+
+# Generar combinaciones
+keys_tree, values_tree = zip(*param_grid_tree.items())
+combinations_tree = [dict(zip(keys_tree, v)) for v in itertools.product(*values_tree)]
+
+# Paralelizacion de la funcion
+def evaluate_set(hyperparameter_set, X, y, lock, best_model_info):
+    X = np.array(X)
+    y = np.array(y)
+    
+    X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=0.20)
+    
+    local_best_accuracy = 0
+    local_best_params = None
+    
+    for idx, s in enumerate(hyperparameter_set):
+        start = time.perf_counter()
+        
+        clf = DecisionTreeClassifier()
+        clf.set_params(**s)
+        clf.fit(X_train, y_train)
+        y_pred = clf.predict(X_test)
+        accuracy = accuracy_score(y_test, y_pred)
+
+        # Exclusion mutua
+        with lock:
+            print(f"Evaluando conjunto {s}")
+            print(f"Accuracy: {accuracy:.4f}")
+            print(f"Combinaciones restantes en este proceso: {len(hyperparameter_set) - (idx + 1)}")
+        
+        end = time.perf_counter()
+        with lock:
+            print(f"Tiempo para esta combinacion: {end - start:.2f} segundos\n")
+
+        # Mejor modelo local
+        if accuracy > local_best_accuracy:
+            local_best_accuracy = accuracy
+            local_best_params = s
+
+    # Mejor modelo en el proceso
+    with lock:
+        if local_best_accuracy > best_model_info['accuracy']:
+            best_model_info['accuracy'] = local_best_accuracy
+            best_model_info['params'] = local_best_params
+
+if __name__ == '__main__':
+    dataset_path = 'Data_for_UCI_named.csv'
+    data = pd.read_csv(dataset_path)
+    
+    print("\n=== Informacion del dataset ===")
+    print(f"Numero de ejemplos: {data.shape[0]}")
+    print(f"Numero de características: {data.shape[1] - 1}")
+    print(f"Columnas del dataset: {data.columns.tolist()}\n")
+
+    # caracteristicas (X), etiquetas (y)
+    X = data.drop(columns=['stabf'])  # 'stabf' es la columna de etiquetas
+    y = data['stabf'].map({'stable': 1, 'unstable': 0})  # 'stable' y 'unstable' a valores binarios
+
+    # Numero de procesos
+    N = 2
+    splits = nivelacion_cargas(combinations_tree, N) 
+    lock = multiprocess.Lock()
+    
+    # Diccionario compartido para guardar el mejor modelo global
+    manager = multiprocess.Manager()
+    best_model_info = manager.dict({'accuracy': 0, 'params': None})
+
+    # Procesos
+    processes = [multiprocess.Process(target=evaluate_set, args=(split, X, y, lock, best_model_info)) for split in splits]
+
+    start_time = time.perf_counter()
+
+    for process in processes:
+        process.start()
+
+    for process in processes:
+        process.join()
+
+    finish_time = time.perf_counter()
+    
+    print("\n*** Mejor Modelo Encontrado ***")
+    print(f"Mejor Accuracy: {best_model_info['accuracy']:.4f}")
+    print(f"Mejores hiperparametros: {best_model_info['params']}")
+    print(f"Tiempo total de ejecucióo: {finish_time - start_time:.2f} segundos")
